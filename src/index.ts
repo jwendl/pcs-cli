@@ -9,6 +9,7 @@ import * as util from 'util';
 import * as uuid from 'uuid';
 import * as forge from 'node-forge';
 import * as momemt from 'moment';
+import * as msRest from 'ms-rest';
 
 import { exec } from 'child_process';
 import { ChoiceType, prompt } from 'inquirer';
@@ -20,7 +21,8 @@ import {
     LinkedSubscription,
     InteractiveLoginOptions, 
     interactiveLoginWithAuthResponse, 
-    loginWithServicePrincipalSecretWithAuthResponse 
+    loginWithServicePrincipalSecretWithAuthResponse,
+    ApplicationTokenCredentials
 } from 'ms-rest-azure';
 import { SubscriptionClient, SubscriptionModels } from 'azure-arm-resource';
 import GraphRbacManagementClient = require('azure-graph');
@@ -70,6 +72,7 @@ const RELEASE_VERSION_PATTERN: RegExp = /((\d*\.){2}(\d*\-preview.)(\d*))(\.\d*)
 
 let cachedAuthResponse: any;
 let answers: Answers = {};
+let credentials: msRest.ServiceClientCredentials;
 
 const program = new Command(packageJson.name)
     .version(packageJson.version, '-v, --version')
@@ -84,8 +87,14 @@ const program = new Command(packageJson.name)
     .option('--servicePrincipalId <servicePrincipalId>', 'Service Principal Id')
     .option('--servicePrincipalSecret <servicePrincipalSecret>', 'Service Principal Secret')
     .option('--versionOverride <versionOverride>', 'Current accepted value is "master"')
-    .option('--domain <domain>', 'This can either be an .onmicrosoft.com domain or the Azure object ID for the tenant',
-            /^(onmirosoft.com)$/i, 'on.microsoft.com')
+    .option('--domainId <domainId>', 'This can either be an .onmicrosoft.com domain or the Azure object ID for the tenant')
+    .option('--solutionName <solutionName>', 'Solution name for your Remote monitoring accelerator')
+    .option('--subscriptionId <subscriptionId>', 'SubscriptionId on which this solution should be created')
+    .option('-l, --location <location>', 'Locaion where the solution will be deployed')
+    .option('-w, --website <website>', 'Name of the website should end in .azurewebsites.net')
+    .option('-u, --username <username>', 'User name for the virtual machine that will be created as part of the solution')
+    .option('-p, --password <password>', 'Password for the virtual machine that will be created as part of the solution')
+    .option('--sshFilePath <sshFilePath>', 'Path to the ssh file path that will be used by standard deployment')
     .on('--help', () => {
         console.log(
             `    Default value for ${chalk.green('-t, --type')} is ${chalk.green('remotemonitoring')}.`
@@ -168,7 +177,12 @@ function main() {
         console.log('Please run %s', `${chalk.yellow('pcs login')}`);
     } else {
         const baseUri = cachedAuthResponse.options.environment.resourceManagerEndpointUrl;
-        const client = new SubscriptionClient(new DeviceTokenCredentials(cachedAuthResponse.options), baseUri);
+        if (program.servicePrincipalId && program.servicePrincipalSecret && program.domainId) {
+            credentials = new ApplicationTokenCredentials(program.servicePrincipalId, program.domainId, program.servicePrincipalSecret);
+        } else {
+            credentials = new DeviceTokenCredentials(cachedAuthResponse.options);
+        }
+        const client = new SubscriptionClient(credentials, baseUri);
         return client.subscriptions.list()
         .then(() => {
             const subs: ChoiceType[] = [];
@@ -192,7 +206,13 @@ function main() {
 
                 const deployUI = DeployUI.instance;
                 let deploymentManager: IDeploymentManager;
-                return prompt(questions.value)
+                let subPrompt: Promise<Answers>;
+                if (program.subscriptionId) {
+                    subPrompt = Promise.resolve<Answers>({ subscriptionId: program.subscriptiondId});
+                } else {
+                    subPrompt = prompt(questions.value);
+                }
+                return subPrompt
                 .then((ans: Answers) => {
                     answers = ans;
                     const index = cachedAuthResponse.subscriptions.findIndex((x: LinkedSubscription) => x.id === answers.subscriptionId);
@@ -202,7 +222,13 @@ function main() {
                         throw new Error(errorMessage);
                     }
                     cachedAuthResponse.options.domain = cachedAuthResponse.subscriptions[index].tenantId;
-                    deploymentManager = new DeploymentManager(cachedAuthResponse.options, answers.subscriptionId, program.type, program.sku);
+                    deploymentManager = new DeploymentManager(
+                        cachedAuthResponse.options,
+                        credentials,
+                        answers.subscriptionId,
+                        program.type,
+                        program.sku
+                    );
                     return deploymentManager.getLocations();
                 })
                 .then((locations: string[] | undefined) => {
@@ -315,17 +341,17 @@ function login(): Promise<void> {
         environment
     };
     let authResponsePromise: Promise<AuthResponse>;
-    if (program.servicePrincipalId && program.servicePrincipalSecret && program.domain) {
+    if (program.servicePrincipalId && program.servicePrincipalSecret && program.domainId) {
         authResponsePromise = loginWithServicePrincipalSecretWithAuthResponse(
             program.servicePrincipalId,
             program.servicePrincipalSecret,
-            program.domain
+            program.domainId
         );
     } else {
         authResponsePromise = interactiveLoginWithAuthResponse(loginOptions);
     }
     return authResponsePromise.then((response: AuthResponse) => {
-        const credentials = response.credentials as any;
+        credentials = response.credentials as any;
         if (!fs.existsSync(pcsTmpDir)) {
             fs.mkdir(pcsTmpDir);
         }
@@ -377,7 +403,12 @@ function createServicePrincipal(azureWebsiteName: string,
     const graphOptions = options;
     graphOptions.tokenAudience = 'graph';
     const baseUri = options.environment ? options.environment.activeDirectoryGraphResourceId : undefined;
-    const graphClient = new GraphRbacManagementClient(new DeviceTokenCredentials(graphOptions), options.domain ? options.domain : '', baseUri);
+    if (program.servicePrincipalId && program.servicePrincipalSecret && program.domainId) {
+        credentials = new ApplicationTokenCredentials(program.servicePrincipalId, program.domainId, program.servicePrincipalSecret, graphOptions);
+    } else {
+        credentials = new DeviceTokenCredentials(graphOptions);
+    }
+    const graphClient = new GraphRbacManagementClient(credentials, options.domain ? options.domain : '', baseUri);
     const startDate = new Date(Date.now());
     let endDate = new Date(startDate.toISOString());
     const m = momemt(endDate);
@@ -471,7 +502,7 @@ function createRoleAssignmentWithRetry(subscriptionId: string, objectId: string,
     // clearing the token audience
     options.tokenAudience = undefined;
     const baseUri = options.environment ? options.environment.resourceManagerEndpointUrl : undefined;
-    const authzClient = new AuthorizationManagementClient(new DeviceTokenCredentials(options), subscriptionId, baseUri);
+    const authzClient = new AuthorizationManagementClient(credentials, subscriptionId, baseUri);
     const assignmentGuid = uuid.v1();
     const roleCreateParams = {
       properties: {
@@ -635,7 +666,7 @@ function askPwdAgain(): Promise<Answers> {
 
 function checkUrlExists(hostName: string, subscriptionId: string): Promise<string | boolean> {
     const baseUri = cachedAuthResponse.options.environment.resourceManagerEndpointUrl;
-    const client = new WebSiteManagementClient(new DeviceTokenCredentials(cachedAuthResponse.options), subscriptionId, baseUri);
+    const client = new WebSiteManagementClient(credentials, subscriptionId, baseUri);
     return client.checkNameAvailability(hostName, 'Site')
     .then((result: any) => {
         if (!result.nameAvailable) {

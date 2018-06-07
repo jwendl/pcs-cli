@@ -3,6 +3,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import * as fetch from 'node-fetch';
+import * as msRest from 'ms-rest';
 
 import { ResourceManagementClient, ResourceModels } from 'azure-arm-resource';
 import { AzureEnvironment, DeviceTokenCredentials, DeviceTokenCredentialsOptions } from 'ms-rest-azure';
@@ -39,14 +40,20 @@ export class DeploymentManager implements IDeploymentManager {
     private _client: ResourceManagementClient;
     private _streamAnalyticsClient: StreamAnalyticsManagementClient;
 
-    constructor(options: DeviceTokenCredentialsOptions, subscriptionId: string, solutionType: string, sku: string) {
+    constructor(
+        options: DeviceTokenCredentialsOptions,
+        credentials: msRest.ServiceClientCredentials,
+        subscriptionId: string,
+        solutionType: string,
+        sku: string
+    ) {
         this._options = options;
         this._solutionType = solutionType;
         this._sku = sku;
         this._subscriptionId = subscriptionId;
         const baseUri = this._options.environment ? this._options.environment.resourceManagerEndpointUrl : undefined;
-        this._client = new ResourceManagementClient(new DeviceTokenCredentials(this._options), subscriptionId, baseUri);
-        this._streamAnalyticsClient = new StreamAnalyticsManagementClient(new DeviceTokenCredentials(this._options), subscriptionId, baseUri);
+        this._client = new ResourceManagementClient(credentials, subscriptionId, baseUri);
+        this._streamAnalyticsClient = new StreamAnalyticsManagementClient(credentials, subscriptionId, baseUri);
     }
 
     public getLocations(): Promise<string[] | undefined> {
