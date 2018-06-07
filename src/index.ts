@@ -12,8 +12,16 @@ import * as momemt from 'moment';
 
 import { exec } from 'child_process';
 import { ChoiceType, prompt } from 'inquirer';
-import { AuthResponse, AzureEnvironment, DeviceTokenCredentials, DeviceTokenCredentialsOptions,
-    LinkedSubscription, InteractiveLoginOptions, interactiveLoginWithAuthResponse } from 'ms-rest-azure';
+import { 
+    AuthResponse,
+    AzureEnvironment,
+    DeviceTokenCredentials,
+    DeviceTokenCredentialsOptions,
+    LinkedSubscription,
+    InteractiveLoginOptions, 
+    interactiveLoginWithAuthResponse, 
+    loginWithServicePrincipalSecretWithAuthResponse 
+} from 'ms-rest-azure';
 import { SubscriptionClient, SubscriptionModels } from 'azure-arm-resource';
 import GraphRbacManagementClient = require('azure-graph');
 import AuthorizationManagementClient = require('azure-arm-authorization');
@@ -76,6 +84,8 @@ const program = new Command(packageJson.name)
     .option('--servicePrincipalId <servicePrincipalId>', 'Service Principal Id')
     .option('--servicePrincipalSecret <servicePrincipalSecret>', 'Service Principal Secret')
     .option('--versionOverride <versionOverride>', 'Current accepted value is "master"')
+    .option('--domain <domain>', 'This can either be an .onmicrosoft.com domain or the Azure object ID for the tenant',
+            /^(onmirosoft.com)$/i, 'on.microsoft.com')
     .on('--help', () => {
         console.log(
             `    Default value for ${chalk.green('-t, --type')} is ${chalk.green('remotemonitoring')}.`
@@ -304,7 +314,17 @@ function login(): Promise<void> {
     const loginOptions: InteractiveLoginOptions = {
         environment
     };
-    return interactiveLoginWithAuthResponse(loginOptions).then((response: AuthResponse) => {
+    let authResponsePromise: Promise<AuthResponse>;
+    if (program.servicePrincipalId && program.servicePrincipalSecret && program.domain) {
+        authResponsePromise = loginWithServicePrincipalSecretWithAuthResponse(
+            program.servicePrincipalId,
+            program.servicePrincipalSecret,
+            program.domain
+        );
+    } else {
+        authResponsePromise = interactiveLoginWithAuthResponse(loginOptions);
+    }
+    return authResponsePromise.then((response: AuthResponse) => {
         const credentials = response.credentials as any;
         if (!fs.existsSync(pcsTmpDir)) {
             fs.mkdir(pcsTmpDir);
