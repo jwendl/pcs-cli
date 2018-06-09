@@ -36,6 +36,14 @@ import DeployUI from './deployui';
 import { Questions, IQuestions } from './questions';
 import { IK8sManager, K8sManager } from './k8smanager';
 import { Config } from './config';
+import { 
+    Application,
+    ServicePrincipal,
+    ApplicationListResult,
+    ApplicationCreateParameters,
+    ServicePrincipalListResult
+} from 'azure-graph/lib/models';
+import { SubscriptionListResult } from 'azure-arm-resource/lib/subscription/models';
 
 const WebSiteManagementClient = require('azure-arm-website');
 
@@ -91,7 +99,7 @@ const program = new Command(packageJson.name)
     .option('--solutionName <solutionName>', 'Solution name for your Remote monitoring accelerator')
     .option('--subscriptionId <subscriptionId>', 'SubscriptionId on which this solution should be created')
     .option('-l, --location <location>', 'Locaion where the solution will be deployed')
-    .option('-w, --website <website>', 'Name of the website should end in .azurewebsites.net')
+    .option('-w, --websiteName <websiteName>', 'Name of the website, default is solution name')
     .option('-u, --username <username>', 'User name for the virtual machine that will be created as part of the solution')
     .option('-p, --password <password>', 'Password for the virtual machine that will be created as part of the solution')
     .option('--sshFilePath <sshFilePath>', 'Path to the ssh file path that will be used by standard deployment')
@@ -184,7 +192,7 @@ function main() {
         }
         const client = new SubscriptionClient(credentials, baseUri);
         return client.subscriptions.list()
-        .then(() => {
+        .then((subs1: SubscriptionListResult) => {
             const subs: ChoiceType[] = [];
             cachedAuthResponse.subscriptions.map((subscription: LinkedSubscription) => {
                 if (subscription.state === 'Enabled') {
@@ -208,7 +216,7 @@ function main() {
                 let deploymentManager: IDeploymentManager;
                 let subPrompt: Promise<Answers>;
                 if (program.subscriptionId) {
-                    subPrompt = Promise.resolve<Answers>({ subscriptionId: program.subscriptiondId});
+                    subPrompt = Promise.resolve<Answers>({ subscriptionId: program.subscriptionId});
                 } else {
                     subPrompt = prompt(questions.value);
                 }
@@ -232,7 +240,29 @@ function main() {
                     return deploymentManager.getLocations();
                 })
                 .then((locations: string[] | undefined) => {
-                    if (locations && locations.length > 0) {
+                    if (program.location && (program.websiteName || program.solutionName) && program.username) {
+                        const ans: Answers = {
+                            adminUsername: program.username,
+                            azureWebsiteName: program.websiteName || program.solutionName,
+                            location: program.location,
+                            solutionName: program.solutionName
+                        };
+                        if (program.sku.toLowerCase() === solutionSkus[solutionSkus.basic]) {
+                            if ( program.password ) {
+                                ans.pwdFirstAttempt = program.password;
+                                ans.pwdSecondAttempt = program.password;
+                            } else {
+                                throw new Error('username and password are required for basic deployment');
+                            }
+                        } else if (program.sku.toLowerCase() === solutionSkus[solutionSkus.standard]) {
+                            if (program.sshFilePath) {
+                                ans.sshFilePath = program.sshFilePath;
+                            } else {
+                                throw new Error('sshFilePath is required for standard deployment type');
+                            }
+                        }
+                        return Promise.resolve<Answers>(ans);
+                    } else if (locations && locations.length > 0) {
                         return prompt(getDeploymentQuestions(locations));
                     }
                     throw new Error('Locations list cannot be empty');
@@ -241,6 +271,7 @@ function main() {
                     answers.location = ans.location;
                     answers.azureWebsiteName = ans.azureWebsiteName;
                     answers.adminUsername = ans.adminUsername;
+                    answers.solutionName = ans.solutionName;
                     if (ans.pwdFirstAttempt !== ans.pwdSecondAttempt) {
                         return askPwdAgain();
                     }
@@ -431,30 +462,70 @@ function createServicePrincipal(azureWebsiteName: string,
         // This guid represents Directory Graph API ID
         resourceAppId: '00000002-0000-0000-c000-000000000000'
     }];
-    const applicationCreateParameters = {
+    const applicationCreateParameters: ApplicationCreateParameters = {
         availableToOtherTenants: false,
         displayName: azureWebsiteName,
         homepage,
         identifierUris,
         oauth2AllowImplicitFlow: true,
-        passwordCredentials: [{
+        replyUrls,
+        requiredResourceAccess
+    };
+    let appPromise: Promise<Application>;
+    let objectId: string = '';
+    let application: Application;
+    if (!existingServicePrincipalSecret) {
+        applicationCreateParameters.passwordCredentials = [{
                 endDate,
                 keyId: uuid.v1(),
                 startDate,
                 value: newServicePrincipalSecret
             }
-        ],
-        replyUrls,
-        requiredResourceAccess
-    };
-    let objectId: string = '';
-    return graphClient.applications.create(applicationCreateParameters)
+        ];
+        appPromise = graphClient.applications.create(applicationCreateParameters);
+    } else {
+        appPromise = graphClient.applications.list({filter: `appId eq '${program.servicePrincipalId}'`})
+        .then((value: ApplicationListResult) => {
+            if (value && value.length) {
+                return value[0];
+            }
+            throw new Error('Could not list any application in this tenant that matches the application id');
+        })
+        .then((result: Application) => {
+            application = result;
+            if (application.objectId) {
+                objectId = application.objectId;
+                return graphClient.applications.patch(objectId, applicationCreateParameters);
+            }
+            throw new Error('Application objectId was undefined');
+        })
+        .then (() => {
+            return application; 
+        });
+    }
+    let servicePrincipalCreateParameters;
+
+    return appPromise
     .then((result: any) => {
-        const servicePrincipalCreateParameters = {
+        servicePrincipalCreateParameters = {
             accountEnabled: true,
             appId: result.appId
         };
-        objectId = result.objectId;
+        return graphClient.servicePrincipals.list({filter: `appId eq '${program.servicePrincipalId}'`})
+        .then((value: ServicePrincipalListResult) => {
+            if (value && value.length) {
+                return value[0];
+            }
+            throw new Error('Could not list any service principals in this tenant that matches the application id');
+        });
+    })
+    .then((sp: ServicePrincipal) => {
+        if (sp) {
+            return sp;
+        } else {
+            return graphClient.servicePrincipals.create(servicePrincipalCreateParameters);
+        }
+    },    () => {
         return graphClient.servicePrincipals.create(servicePrincipalCreateParameters);
     })
     .then((sp: any) => {
@@ -477,7 +548,6 @@ function createServicePrincipal(azureWebsiteName: string,
                     domainName = value.name;
                 }
             });
-                
             return {
                 appId,
                 domainName,
